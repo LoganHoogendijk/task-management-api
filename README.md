@@ -10,7 +10,7 @@ SQLAlchemy (async), Alembic, and Postgres.
 - Pydantic / pydantic-settings (input validation & config)
 - SQLAlchemy 2.0 (async) + asyncpg
 - Alembic (migrations)
-- PostgreSQL 18
+- PostgreSQL 17
 - Uvicorn (ASGI server)
 - pytest / pytest-asyncio
 
