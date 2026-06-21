@@ -1,0 +1,10 @@
+strawberry-graphql[debug-server]
+uvicorn[standard]
+pydantic
+sqlalchemy[asyncio]
+asyncpg
+alembic
+pytest
+pytest-asyncio
+httpx
+python-dotenv
