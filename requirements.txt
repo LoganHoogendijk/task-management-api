@@ -1,6 +1,8 @@
 strawberry-graphql[debug-server]
+starlette
 uvicorn[standard]
 pydantic
+pydantic-settings
 sqlalchemy[asyncio]
 asyncpg
 alembic
