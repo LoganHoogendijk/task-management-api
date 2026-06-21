@@ -2,7 +2,7 @@ import uuid
 import strawberry
 from graphql import GraphQLError
 from pydantic import ValidationError
-from sqlalchemy import update as sa_update
+from sqlalchemy import select, update as sa_update
 
 from app.models import Task, Project, User, TaskStatus as ModelStatus, TaskPriority as ModelPriority
 from app.errors import (
@@ -12,8 +12,11 @@ from app.errors import (
 from app.schema.types import (
     TaskType, TaskStatus, TaskPriority, task_to_type,
     CreateTaskGQLInput, UpdateTaskGQLInput,
+    BulkTaskFailure, BulkTaskMutationResult,
 )
 from app.schema.inputs import CreateTaskInput, UpdateTaskInput
+
+MAX_BULK_IDS = 100
 
 
 def _require_auth(info) -> uuid.UUID:
@@ -193,3 +196,64 @@ class Mutation:
         await session.delete(task)
         await session.commit()
         return True
+
+    @strawberry.mutation
+    async def bulk_change_task_status(
+        self, info: strawberry.Info, ids: list[uuid.UUID], status: TaskStatus
+    ) -> BulkTaskMutationResult:
+        """Set the same status on many tasks in one round trip.
+
+        Same authorization rule as `changeTaskStatus` (assignee only),
+        applied per task rather than failing the whole batch on one bad id.
+        Deliberately skips per-item expected `version` (see README) — this
+        is a "set state X on these tasks" operation, not a guarded edit of
+        one task, so it's naturally idempotent: calling it again with the
+        same ids+status is a no-op in effect (status unchanged), even
+        though `version` still increments each time.
+        """
+        session = info.context.session
+        actor_id = _require_auth(info)
+
+        if not ids:
+            return BulkTaskMutationResult(succeeded=[], failed=[])
+        if len(ids) > MAX_BULK_IDS:
+            raise GraphQLError(
+                f"Cannot operate on more than {MAX_BULK_IDS} tasks at once",
+                extensions={"code": "BAD_USER_INPUT"},
+            )
+
+        unique_ids = list(dict.fromkeys(ids))  # de-dupe, preserve order
+
+        result = await session.execute(select(Task).where(Task.id.in_(unique_ids)))
+        found = {t.id: t for t in result.scalars()}
+
+        failed: list[BulkTaskFailure] = []
+        allowed_ids: list[uuid.UUID] = []
+
+        for task_id in unique_ids:
+            task = found.get(task_id)
+            if task is None:
+                err = TaskNotFoundError(task_id)
+                failed.append(BulkTaskFailure(id=task_id, code=err.code, message=str(err)))
+                continue
+            if task.assignee_id != actor_id:
+                err = PermissionDeniedError("Only the assignee can change task status")
+                failed.append(BulkTaskFailure(id=task_id, code=err.code, message=str(err)))
+                continue
+            allowed_ids.append(task_id)
+
+        if not allowed_ids:
+            return BulkTaskMutationResult(succeeded=[], failed=failed)
+
+        stmt = (
+            sa_update(Task)
+            .where(Task.id.in_(allowed_ids))
+            .values(status=ModelStatus(status.value), version=Task.version + 1)
+            .returning(Task)
+        )
+        result = await session.execute(stmt)
+        updated_tasks = result.scalars().all()
+        await session.commit()
+
+        succeeded = [task_to_type(t) for t in updated_tasks]
+        return BulkTaskMutationResult(succeeded=succeeded, failed=failed)

@@ -24,6 +24,15 @@ mutation($id: UUID!, $version: Int!, $assigneeId: UUID!) {
 }
 """
 
+BULK_CHANGE_STATUS = """
+mutation($ids: [UUID!]!, $status: TaskStatus!) {
+  bulkChangeTaskStatus(ids: $ids, status: $status) {
+    succeeded { id status version }
+    failed { id code message }
+  }
+}
+"""
+
 
 async def _create_task(session, creator_id, project_id, **overrides):
     ctx = make_context(session, current_user_id=creator_id)
@@ -147,3 +156,91 @@ async def test_only_creator_can_reassign(session, users, project):
     )
     assert result.errors is not None
     assert result.errors[0].extensions["code"] == "PERMISSION_DENIED"
+
+
+@pytest.mark.asyncio
+async def test_bulk_change_task_status_success(session, users, project):
+    alice, bob = users
+    task_a = await _create_task(session, alice.id, project.id, assigneeId=str(bob.id))
+    task_b = await _create_task(session, alice.id, project.id, assigneeId=str(bob.id))
+
+    bob_ctx = make_context(session, current_user_id=bob.id)
+    result = await schema.execute(
+        BULK_CHANGE_STATUS,
+        variable_values={"ids": [task_a["id"], task_b["id"]], "status": "DONE"},
+        context_value=bob_ctx,
+    )
+    assert result.errors is None
+    payload = result.data["bulkChangeTaskStatus"]
+    assert payload["failed"] == []
+    succeeded_ids = {t["id"] for t in payload["succeeded"]}
+    assert succeeded_ids == {task_a["id"], task_b["id"]}
+    assert all(t["status"] == "DONE" for t in payload["succeeded"])
+    assert all(t["version"] == 2 for t in payload["succeeded"])  # bumped from 1 -> 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_change_task_status_partial_failure(session, users, project):
+    import uuid
+    alice, bob = users
+    # bob is the assignee — should succeed
+    allowed_task = await _create_task(session, alice.id, project.id, assigneeId=str(bob.id))
+    # alice is the assignee, not bob — should be rejected
+    forbidden_task = await _create_task(session, alice.id, project.id, assigneeId=str(alice.id))
+    missing_id = str(uuid.uuid4())
+
+    bob_ctx = make_context(session, current_user_id=bob.id)
+    result = await schema.execute(
+        BULK_CHANGE_STATUS,
+        variable_values={"ids": [allowed_task["id"], forbidden_task["id"], missing_id], "status": "DONE"},
+        context_value=bob_ctx,
+    )
+    assert result.errors is None
+    payload = result.data["bulkChangeTaskStatus"]
+
+    assert [t["id"] for t in payload["succeeded"]] == [allowed_task["id"]]
+
+    failures_by_id = {f["id"]: f["code"] for f in payload["failed"]}
+    assert failures_by_id[forbidden_task["id"]] == "PERMISSION_DENIED"
+    assert failures_by_id[missing_id] == "TASK_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_bulk_change_task_status_requires_auth(session, users, project):
+    alice, bob = users
+    task = await _create_task(session, alice.id, project.id, assigneeId=str(bob.id))
+
+    anon_ctx = make_context(session, current_user_id=None)
+    result = await schema.execute(
+        BULK_CHANGE_STATUS,
+        variable_values={"ids": [task["id"]], "status": "DONE"},
+        context_value=anon_ctx,
+    )
+    assert result.errors is not None
+    assert result.errors[0].extensions["code"] == "UNAUTHENTICATED"
+
+
+@pytest.mark.asyncio
+async def test_bulk_change_task_status_is_batched(session, users, project, query_log):
+    alice, bob = users
+    tasks = [
+        await _create_task(session, alice.id, project.id, assigneeId=str(bob.id))
+        for _ in range(5)
+    ]
+    bob_ctx = make_context(session, current_user_id=bob.id)
+
+    query_log.clear()
+    result = await schema.execute(
+        BULK_CHANGE_STATUS,
+        variable_values={"ids": [t["id"] for t in tasks], "status": "DONE"},
+        context_value=bob_ctx,
+    )
+    assert result.errors is None
+    assert len(result.data["bulkChangeTaskStatus"]["succeeded"]) == 5
+
+    # 1 SELECT to fetch all candidate tasks + 1 UPDATE...RETURNING for the
+    # allowed set, regardless of how many ids are in the batch — not 5 of each.
+    select_statements = [s for s in query_log if s.strip().upper().startswith("SELECT")]
+    update_statements = [s for s in query_log if s.strip().upper().startswith("UPDATE")]
+    assert len(select_statements) <= 1
+    assert len(update_statements) <= 1

@@ -126,3 +126,14 @@ class UpdateTaskGQLInput:
     title: Optional[str] = strawberry.UNSET
     description: Optional[str] = strawberry.UNSET
     priority: Optional[TaskPriority] = strawberry.UNSET
+
+@strawberry.type
+class BulkTaskFailure:
+    id: uuid.UUID
+    code: str
+    message: str
+
+@strawberry.type
+class BulkTaskMutationResult:
+    succeeded: list[TaskType]
+    failed: list[BulkTaskFailure]
